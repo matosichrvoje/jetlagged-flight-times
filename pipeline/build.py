@@ -20,8 +20,8 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEEP_DAYS = 35          # rolling window of observations
 MAX_OBS = 24            # per callsign+route
-AIRPORT_KM = 12         # how close the first/last point must be to an airport
-LOW_FT = 4000           # first/last point must be below this (or on the ground)
+AIRPORT_KM = 8          # how close a touchdown/lift-off point must be to an airport
+LOW_FT = 1500           # below this (or on the ground) counts as at the airport
 TAXI_OUT = 15 * 60      # wheels-up → typical gate departure on the ticket
 TAXI_IN = 8 * 60        # touchdown → typical gate arrival
 
@@ -142,6 +142,43 @@ def scan(raw):
             [l for l in landed if keep(l[1])])
 
 
+DEBUG = set(filter(None, os.environ.get("DEBUG_CALLSIGNS", "").split(",")))
+
+
+def debug_dump(raw):
+    """For DEBUG_CALLSIGNS: print a compact altitude/position walk of any
+    aircraft that used one of them today."""
+    try:
+        doc = json.loads(gzip.decompress(raw))
+    except Exception:
+        return None
+    trace = doc.get("trace") or []
+    used = {(p[8] or {}).get("flight", "").strip() for p in trace if p[8]}
+    hit = used & DEBUG
+    if not hit:
+        return None
+    base = doc["timestamp"]
+    lines = [f"== {doc.get('icao')} {doc.get('r')} {doc.get('t')} callsigns={sorted(used)}"]
+    prev = None
+    for p in trace:
+        t = base + p[0]
+        state = "LOW" if low(p) else ("HIGH" if high(p) else "mid")
+        gap = "" if prev is None else f" gap={int((t - prev) / 60)}m"
+        if prev is None or state != "mid" or (t - prev) > 1800:
+            ap = nearest(p[1], p[2]) if low(p) else None
+            lines.append(f"  {datetime.fromtimestamp(t, timezone.utc):%H:%M} {state:4} alt={p[3]} "
+                         f"{p[1]:.2f},{p[2]:.2f} ap={ap[0] if ap else '-'} cs={(p[8] or {}).get('flight', '').strip()}{gap}")
+        prev = t
+    # Collapse runs of identical state lines.
+    out, last = [], None
+    for l in lines:
+        key = l.split()[1] if l.startswith("  ") else None
+        if key and key == last and "gap=" not in l.split("cs=")[-1]:
+            continue
+        out.append(l); last = key
+    return "\n".join(out[:120])
+
+
 def members(stream):
     with tarfile.open(fileobj=stream, mode="r|") as tar:
         for m in tar:
@@ -191,6 +228,11 @@ def main():
 
     flights, opened, landed, files = [], [], [], 0
     with ProcessPoolExecutor(args.workers) as pool:
+        if DEBUG:
+            for txt in pool.map(debug_dump, members(sys.stdin.buffer), chunksize=64):
+                if txt:
+                    print(txt, file=sys.stderr)
+            return
         for done, o, l in pool.map(scan, members(sys.stdin.buffer), chunksize=64):
             flights += done; opened += o; landed += l
             files += 1
