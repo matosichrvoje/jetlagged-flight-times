@@ -67,11 +67,12 @@ jobs:
           for u in $URLS; do curl -sfL --retry 5 "$u"; done | python3 pipeline/build.py --date "$DATE" --site site
 
       - name: Publish to GitHub Pages
-        if: steps.day.outputs.skip == ''
+        if: steps.day.outputs.skip != 'debug'
         run: |
           cd site
           touch .nojekyll
           cp ../README.md ./README.md
+          cp ../privacy.html ./privacy.html
           git init -q -b gh-pages
           git add -A
           git -c user.name="nightly" -c user.email="nightly@users.noreply.github.com" commit -qm "Flight times through ${{ steps.day.outputs.date }}"
