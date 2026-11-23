@@ -58,7 +58,7 @@ jobs:
           for u in $URLS; do curl -sfL --retry 5 "$u"; done | python3 pipeline/build.py --date "$DATE" --site site
 
       - name: Process adsb.lol archive
-        if: steps.day.outputs.skip == '
+        if: steps.day.outputs.skip == ''
         run: |
           DATE=${{ steps.day.outputs.date }}
           TAG="v${DATE//-/.}-planes-readsb-prod-0"
