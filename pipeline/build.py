@@ -95,40 +95,55 @@ def scan(raw):
     origin, dep_t = None, None       # last airport we sat at, and when we left it
     climbed = False                  # been at cruise since leaving origin
     calls = defaultdict(int)
-    seen_low_yet = False             # first low point of the day not reached yet
+    seen_low_yet = False
+    run = []                         # consecutive low points: one arrival/stay/departure
 
     def callsign():
         return max(calls, key=calls.get) if calls else None
 
+    def settle(run):
+        """A stretch near the ground. The airport is taken where the wheels
+        are on the ground (or the lowest point), so approach paths over
+        neighbouring airfields don't count."""
+        nonlocal origin, dep_t, climbed, calls, seen_low_yet
+        ground = [p for p in run if p[3] == "ground"]
+        anchor = ground[len(ground) // 2] if ground else min(run, key=lambda p: p[3])
+        ap = airport_at(anchor)
+        if ap is None:
+            return
+        t_in, t_out = base + run[0][0], base + run[-1][0]
+        if not seen_low_yet and origin is None and climbed:
+            cs = callsign()
+            if cs:
+                landed.append((hexid, cs, ap, t_in))          # flight from yesterday
+        elif origin and climbed and ap != origin:
+            cs = callsign()
+            if cs and 20 * 60 < t_in - dep_t < MAX_FLIGHT_S:
+                done.append((cs, origin, ap, dep_t, t_in))
+        seen_low_yet = True
+        if ap != origin or climbed:
+            calls = defaultdict(int)
+        origin, dep_t, climbed = ap, t_out, False
+
     for p in trace:
-        t = base + p[0]
         det = p[8]
         if det and det.get("flight") and not low(p):
             cs = det["flight"].strip()    # airborne only: parked jets keep the last flight's number
             if cs:
                 calls[cs] += 1
         if low(p):
-            ap = airport_at(p)
-            if ap is None:
-                continue
-            if not seen_low_yet and origin is None and climbed:
-                # Day began in the air: landing of a flight from yesterday.
-                cs = callsign()
-                if cs:
-                    landed.append((hexid, cs, ap, t))
-            elif origin and climbed and ap != origin:
-                cs = callsign()
-                if cs and 20 * 60 < t - dep_t < MAX_FLIGHT_S:
-                    done.append((cs, origin, ap, dep_t, t))
-            seen_low_yet = True
-            if ap != origin or climbed:
-                calls = defaultdict(int)
-            origin, dep_t, climbed = ap, t, False
-        elif high(p):
+            run.append(p)
+            continue
+        if run:
+            settle(run)
+            run = []
+        if high(p):
             if origin is None and not seen_low_yet:
                 climbed = True       # airborne since before midnight
             elif origin:
                 climbed = True
+    if run:
+        settle(run)
 
     # Still airborne at the end of the day.
     if origin and climbed and trace and base + 86400 - (base + trace[-1][0]) < 3 * 3600:
