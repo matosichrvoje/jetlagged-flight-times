@@ -22,8 +22,6 @@ KEEP_DAYS = 35          # rolling window of observations
 MAX_OBS = 24            # per callsign+route
 AIRPORT_KM = 12         # how close the first/last point must be to an airport
 LOW_FT = 4000           # first/last point must be below this (or on the ground)
-NEW_LEG = 2             # readsb trace flag: this point starts a new leg
-GAP_S = 4 * 3600        # a silence this long also splits legs
 TAXI_OUT = 15 * 60      # wheels-up → typical gate departure on the ticket
 TAXI_IN = 8 * 60        # touchdown → typical gate arrival
 
@@ -59,34 +57,22 @@ def low(p):
 
 # ---------- one aircraft ----------
 
-def legs(doc):
-    """Yield (callsign, start_point, end_point, base_ts) for each leg in a trace."""
-    base = doc["timestamp"]
-    trace = doc.get("trace") or []
-    cur, prev_t, calls = [], None, defaultdict(int)
+CRUISE_FT = 10000       # must climb above this between two airports
+MAX_FLIGHT_S = 20 * 3600
 
-    def flush():
-        if len(cur) >= 2 and calls:
-            cs = max(calls, key=calls.get)
-            yield cs, cur[0], cur[-1]
 
-    for p in trace:
-        t = p[0]
-        if cur and ((p[6] or 0) & NEW_LEG or (prev_t is not None and t - prev_t > GAP_S)):
-            yield from flush()
-            cur, calls = [], defaultdict(int)
-        cur.append(p)
-        det = p[8]
-        if det and det.get("flight"):
-            cs = det["flight"].strip()
-            if cs:
-                calls[cs] += 1
-        prev_t = t
-    yield from flush()
+def high(p):
+    alt = p[3]
+    return isinstance(alt, (int, float)) and alt >= CRUISE_FT
 
 
 def scan(raw):
-    """Parse one trace file → (finished flights, open take-offs, open landings)."""
+    """Walk one aircraft's day: airport → climb → different airport is a flight.
+
+    Silences mid-flight (oceans, poor coverage) don't split anything; only
+    being low near an airport does. Returns (flights, open at midnight,
+    landed after midnight).
+    """
     try:
         doc = json.loads(gzip.decompress(raw))
     except Exception:
@@ -95,20 +81,65 @@ def scan(raw):
         except Exception:
             return [], [], []
     hexid, base = doc.get("icao"), doc.get("timestamp", 0)
+    trace = doc.get("trace") or []
+    cache = {}
+
+    def airport_at(p):
+        key = (round(p[1], 2), round(p[2], 2))
+        if key not in cache:
+            a = nearest(p[1], p[2])
+            cache[key] = a[0] if a else None
+        return cache[key]
+
     done, opened, landed = [], [], []
-    for cs, a, b in legs(doc):
-        if not (cs[:3].isalpha() and any(c.isdigit() for c in cs)):
-            continue  # airline-style callsigns only: ABC123
-        t0, t1 = base + a[0], base + b[0]
-        o = nearest(a[1], a[2]) if low(a) else None
-        d = nearest(b[1], b[2]) if low(b) else None
-        if o and d and o[0] != d[0] and t1 - t0 > 20 * 60:
-            done.append((cs, o[0], d[0], t0, t1))
-        elif o and not d and base + 86400 - t1 < 30 * 60:
-            opened.append((hexid, cs, o[0], t0))          # still flying at midnight
-        elif d and not o and t0 - base < 30 * 60:
-            landed.append((hexid, cs, d[0], t1))          # was flying at midnight
-    return done, opened, landed
+    origin, dep_t = None, None       # last airport we sat at, and when we left it
+    climbed = False                  # been at cruise since leaving origin
+    calls = defaultdict(int)
+    seen_low_yet = False             # first low point of the day not reached yet
+
+    def callsign():
+        return max(calls, key=calls.get) if calls else None
+
+    for p in trace:
+        t = base + p[0]
+        det = p[8]
+        if det and det.get("flight") and not low(p):
+            cs = det["flight"].strip()    # airborne only: parked jets keep the last flight's number
+            if cs:
+                calls[cs] += 1
+        if low(p):
+            ap = airport_at(p)
+            if ap is None:
+                continue
+            if not seen_low_yet and origin is None and climbed:
+                # Day began in the air: landing of a flight from yesterday.
+                cs = callsign()
+                if cs:
+                    landed.append((hexid, cs, ap, t))
+            elif origin and climbed and ap != origin:
+                cs = callsign()
+                if cs and 20 * 60 < t - dep_t < MAX_FLIGHT_S:
+                    done.append((cs, origin, ap, dep_t, t))
+            seen_low_yet = True
+            if ap != origin or climbed:
+                calls = defaultdict(int)
+            origin, dep_t, climbed = ap, t, False
+        elif high(p):
+            if origin is None and not seen_low_yet:
+                climbed = True       # airborne since before midnight
+            elif origin:
+                climbed = True
+
+    # Still airborne at the end of the day.
+    if origin and climbed and trace and base + 86400 - (base + trace[-1][0]) < 3 * 3600:
+        cs = callsign()
+        if cs:
+            opened.append((hexid, cs, origin, dep_t))
+
+    keep = lambda cs: cs[:3].isalpha() and any(c.isdigit() for c in cs)
+    return ([f for f in done if keep(f[0])],
+            [o for o in opened if keep(o[1])],
+            [l for l in landed if keep(l[1])])
 
 
 def members(stream):
