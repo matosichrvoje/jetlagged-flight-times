@@ -1,0 +1,63 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "30 7 * * *"   # adsb.lol publishes yesterday's archive around 03:30 UTC
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "UTC day to process (YYYY-MM-DD); empty = yesterday"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency: nightly
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore published state
+        run: |
+          mkdir -p site
+          if git ls-remote --exit-code origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git --work-tree=site checkout origin/gh-pages -- .
+            git reset -q
+          fi
+
+      - name: Pick the day
+        id: day
+        run: |
+          DATE="${{ inputs.date }}"
+          [ -z "$DATE" ] && DATE=$(date -u -d yesterday +%F)
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          if [ -f site/meta.json ] && grep -q "\"updated\": \"$DATE\"" site/meta.json; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Process adsb.lol archive
+        if: steps.day.outputs.skip != 'true'
+        run: |
+          DATE=${{ steps.day.outputs.date }}
+          TAG="v${DATE//-/.}-planes-readsb-prod-0"
+          URLS=$(gh api "repos/adsblol/globe_history_${DATE:0:4}/releases/tags/$TAG" --jq '.assets[].browser_download_url' | sort)
+          [ -n "$URLS" ] || { echo "No archive for $DATE yet"; exit 1; }
+          for u in $URLS; do curl -sfL --retry 5 "$u"; done | python3 pipeline/build.py --date "$DATE" --site site
+
+      - name: Publish to GitHub Pages
+        if: steps.day.outputs.skip != 'true'
+        run: |
+          cd site
+          touch .nojekyll
+          cp ../README.md ./README.md
+          git init -q -b gh-pages
+          git add -A
+          git -c user.name="nightly" -c user.email="nightly@users.noreply.github.com" commit -qm "Flight times through ${{ steps.day.outputs.date }}"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" gh-pages
